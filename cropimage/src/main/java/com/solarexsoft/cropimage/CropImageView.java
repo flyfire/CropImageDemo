@@ -3,9 +3,16 @@ package com.solarexsoft.cropimage;
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.BitmapRegionDecoder;
+import android.graphics.Canvas;
 import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.PointF;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
@@ -19,19 +26,39 @@ import android.support.annotation.Nullable;
 import android.support.v7.widget.AppCompatImageView;
 import android.util.AttributeSet;
 import android.util.DisplayMetrics;
+import android.view.MotionEvent;
 import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.Interpolator;
 import android.widget.ImageView;
 
 import com.solarexsoft.cropimage.animation.SimpleValueAnimator;
+import com.solarexsoft.cropimage.animation.SimpleValueAnimatorListener;
 import com.solarexsoft.cropimage.animation.ValueAnimatorV14;
 import com.solarexsoft.cropimage.animation.ValueAnimatorV8;
 import com.solarexsoft.cropimage.callback.Callback;
+import com.solarexsoft.cropimage.callback.CropCallback;
+import com.solarexsoft.cropimage.callback.LoadCallback;
+import com.solarexsoft.cropimage.callback.SaveCallback;
+import com.solarexsoft.cropimage.util.Logger;
+import com.solarexsoft.cropimage.util.Utils;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import io.reactivex.Completable;
+import io.reactivex.CompletableEmitter;
+import io.reactivex.CompletableOnSubscribe;
+import io.reactivex.Single;
+import io.reactivex.annotations.NonNull;
+import io.reactivex.disposables.Disposable;
+import io.reactivex.functions.Action;
+import io.reactivex.functions.Consumer;
 
 /*
  * Creadted by houruhou on 2023/01/12 13:45
@@ -244,6 +271,394 @@ public class CropImageView extends AppCompatImageView {
         this.mOutputImageHeight = ss.outputImageHeight;
     }
 
+    public Bitmap getImageBitmap() {
+        return getBitmap();
+    }
+
+    public void setImageBitmap(Bitmap bitmap) {
+        super.setImageBitmap(bitmap);
+    }
+
+    @Override public void setImageResource(int resId) {
+        mIsInitialized = false;
+        resetImageInfo();
+        super.setImageResource(resId);
+        updateLayout();
+    }
+
+    @Override public void setImageDrawable(Drawable drawable) {
+        mIsInitialized = false;
+        resetImageInfo();
+        setImageDrawableInternal(drawable);
+    }
+
+    private void setImageDrawableInternal(Drawable drawable) {
+        super.setImageDrawable(drawable);
+        updateLayout();
+    }
+
+    @Override public void setImageURI(Uri uri) {
+        mIsInitialized = false;
+        super.setImageURI(uri);
+        updateLayout();
+    }
+
+    public void startLoad(final Uri sourceUri, final LoadCallback callback) {
+        loadAsync(sourceUri, callback);
+    }
+
+    public void loadAsync(final Uri sourceUri, final LoadCallback callback) {
+        loadAsync(sourceUri, false, null, callback);
+    }
+
+    public void loadAsync(final Uri sourceUri, final boolean useThumbnail,
+                          final RectF initialFrameRect, final LoadCallback callback) {
+
+        mExecutor.submit(new Runnable() {
+            @Override public void run() {
+                try {
+                    mIsLoading.set(true);
+
+                    mSourceUri = sourceUri;
+                    mInitialFrameRect = initialFrameRect;
+
+                    if (useThumbnail) {
+                        applyThumbnail(sourceUri);
+                    }
+
+                    final Bitmap sampled = getImage(sourceUri);
+
+                    mHandler.post(new Runnable() {
+                        @Override public void run() {
+                            mAngle = mExifRotation;
+                            setImageDrawableInternal(new BitmapDrawable(getResources(), sampled));
+                            if (callback != null) callback.onSuccess();
+                        }
+                    });
+                } catch (Exception e) {
+                    postErrorOnMainThread(callback, e);
+                } finally {
+                    mIsLoading.set(false);
+                }
+            }
+        });
+    }
+
+    public Completable loadAsCompletable(final Uri sourceUri) {
+        return loadAsCompletable(sourceUri, false, null);
+    }
+
+    public Completable loadAsCompletable(final Uri sourceUri, final boolean useThumbnail,
+                                         final RectF initialFrameRect) {
+        return Completable.create(new CompletableOnSubscribe() {
+
+            @Override public void subscribe(@NonNull final CompletableEmitter emitter) throws Exception {
+
+                mInitialFrameRect = initialFrameRect;
+                mSourceUri = sourceUri;
+
+                if (useThumbnail) {
+                    applyThumbnail(sourceUri);
+                }
+
+                final Bitmap sampled = getImage(sourceUri);
+
+                mHandler.post(new Runnable() {
+                    @Override public void run() {
+                        mAngle = mExifRotation;
+                        setImageDrawableInternal(new BitmapDrawable(getResources(), sampled));
+                        emitter.onComplete();
+                    }
+                });
+            }
+        }).doOnSubscribe(new Consumer<Disposable>() {
+            @Override public void accept(@NonNull Disposable disposable) throws Exception {
+                mIsLoading.set(true);
+            }
+        }).doFinally(new Action() {
+            @Override public void run() throws Exception {
+                mIsLoading.set(false);
+            }
+        });
+    }
+
+    public LoadRequest load(Uri sourceUri) {
+        return new LoadRequest(this, sourceUri);
+    }
+
+    private void applyThumbnail(Uri sourceUri) {
+        final Bitmap thumb = getThumbnail(sourceUri);
+        if (thumb == null) return;
+        mHandler.post(new Runnable() {
+            @Override public void run() {
+                mAngle = mExifRotation;
+                setImageDrawableInternal(new BitmapDrawable(getResources(), thumb));
+            }
+        });
+    }
+
+    private Bitmap getImage(Uri sourceUri) {
+
+        if (sourceUri == null) {
+            throw new IllegalStateException("Source Uri must not be null.");
+        }
+
+        mExifRotation = Utils.getExifOrientation(getContext(), mSourceUri);
+        int maxSize = Utils.getMaxSize();
+        int requestSize = Math.max(mViewWidth, mViewHeight);
+        if (requestSize == 0) requestSize = maxSize;
+
+        final Bitmap sampledBitmap =
+                Utils.decodeSampledBitmapFromUri(getContext(), mSourceUri, requestSize);
+        mInputImageWidth = Utils.sInputImageWidth;
+        mInputImageHeight = Utils.sInputImageHeight;
+        return sampledBitmap;
+    }
+
+    private Bitmap getThumbnail(Uri sourceUri) {
+
+        if (sourceUri == null) {
+            throw new IllegalStateException("Source Uri must not be null.");
+        }
+
+        mExifRotation = Utils.getExifOrientation(getContext(), mSourceUri);
+        int requestSize = (int) (Math.max(mViewWidth, mViewHeight) * 0.1f);
+        if (requestSize == 0) return null;
+
+        final Bitmap sampledBitmap =
+                Utils.decodeSampledBitmapFromUri(getContext(), mSourceUri, requestSize);
+        mInputImageWidth = Utils.sInputImageWidth;
+        mInputImageHeight = Utils.sInputImageHeight;
+        return sampledBitmap;
+    }
+
+    public void rotateImage(RotateDegrees degrees, int durationMillis) {
+        if (mIsRotating) {
+            getAnimator().cancelAnimation();
+        }
+
+        final float currentAngle = mAngle;
+        final float newAngle = (mAngle + degrees.getValue());
+        final float angleDiff = newAngle - currentAngle;
+        final float currentScale = mScale;
+        final float newScale = calcScale(mViewWidth, mViewHeight, newAngle);
+
+        if (mIsAnimationEnabled) {
+            final float scaleDiff = newScale - currentScale;
+            SimpleValueAnimator animator = getAnimator();
+            animator.addAnimatorListener(new SimpleValueAnimatorListener() {
+                @Override public void onAnimationStarted() {
+                    mIsRotating = true;
+                }
+
+                @Override public void onAnimationUpdate(float scale) {
+                    mAngle = currentAngle + angleDiff * scale;
+                    mScale = currentScale + scaleDiff * scale;
+                    setMatrix();
+                    invalidate();
+                }
+
+                @Override public void onAnimationFinished() {
+                    mAngle = newAngle % 360;
+                    mScale = newScale;
+                    mInitialFrameRect = null;
+                    setupLayout(mViewWidth, mViewHeight);
+                    mIsRotating = false;
+                }
+            });
+            animator.startAnimation(durationMillis);
+        } else {
+            mAngle = newAngle % 360;
+            mScale = newScale;
+            setupLayout(mViewWidth, mViewHeight);
+        }
+    }
+
+    public void rotateImage(RotateDegrees degrees) {
+        rotateImage(degrees, mAnimationDurationMillis);
+    }
+
+    public Bitmap getCroppedBitmap() {
+        Bitmap source = getBitmap();
+        if (source == null) return null;
+
+        Bitmap rotated = getRotatedBitmap(source);
+        Rect cropRect = calcCropRect(source.getWidth(), source.getHeight());
+        Bitmap cropped = Bitmap.createBitmap(rotated, cropRect.left, cropRect.top, cropRect.width(),
+                cropRect.height(), null, false);
+        if (rotated != cropped && rotated != source) {
+            rotated.recycle();
+        }
+
+        if (mCropMode == CropMode.CIRCLE) {
+            Bitmap circle = getCircularBitmap(cropped);
+            if (cropped != getBitmap()) {
+                cropped.recycle();
+            }
+            cropped = circle;
+        }
+        return cropped;
+    }
+
+    public Bitmap getCircularBitmap(Bitmap square) {
+        if (square == null) return null;
+        Bitmap output =
+                Bitmap.createBitmap(square.getWidth(), square.getHeight(), Bitmap.Config.ARGB_8888);
+
+        final Rect rect = new Rect(0, 0, square.getWidth(), square.getHeight());
+        Canvas canvas = new Canvas(output);
+
+        int halfWidth = square.getWidth() / 2;
+        int halfHeight = square.getHeight() / 2;
+
+        final Paint paint = new Paint();
+        paint.setAntiAlias(true);
+        paint.setFilterBitmap(true);
+
+        canvas.drawCircle(halfWidth, halfHeight, Math.min(halfWidth, halfHeight), paint);
+        paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_IN));
+        canvas.drawBitmap(square, rect, rect, paint);
+        return output;
+    }
+
+    public void startCrop(final Uri saveUri, final CropCallback cropCallback,
+                          final SaveCallback saveCallback) {
+
+        mExecutor.submit(new Runnable() {
+            @Override public void run() {
+                Bitmap croppedImage = null;
+
+                try {
+                    mIsCropping.set(true);
+
+                    croppedImage = cropImage();
+
+                    final Bitmap cropped = croppedImage;
+                    mHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (cropCallback != null) cropCallback.onSuccess(cropped);
+                            if (mIsDebug) invalidate();
+                        }
+                    });
+
+                    saveImage(croppedImage, saveUri);
+
+                    mHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (saveCallback != null) saveCallback.onSuccess(saveUri);
+                        }
+                    });
+                } catch (Exception e) {
+                    if (croppedImage == null) {
+                        postErrorOnMainThread(cropCallback, e);
+                    } else {
+                        postErrorOnMainThread(saveCallback, e);
+                    }
+                } finally {
+                    mIsCropping.set(false);
+                }
+            }
+        });
+    }
+
+    public void cropAsync(final Uri sourceUri, final CropCallback cropCallback) {
+        mExecutor.submit(new Runnable() {
+            @Override public void run() {
+                try {
+                    mIsCropping.set(true);
+
+                    if (sourceUri != null) mSourceUri = sourceUri;
+
+                    final Bitmap cropped = cropImage();
+
+                    mHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (cropCallback != null) cropCallback.onSuccess(cropped);
+                            if (mIsDebug) invalidate();
+                        }
+                    });
+                } catch (Exception e) {
+                    postErrorOnMainThread(cropCallback, e);
+                } finally {
+                    mIsCropping.set(false);
+                }
+            }
+        });
+    }
+
+    public void cropAsync(final CropCallback cropCallback) {
+        cropAsync(null, cropCallback);
+    }
+
+    public Single<Bitmap> cropAsSingle(final Uri sourceUri) {
+        return Single.fromCallable(new Callable<Bitmap>() {
+
+            @Override public Bitmap call() throws Exception {
+                if (sourceUri != null) mSourceUri = sourceUri;
+                return cropImage();
+            }
+        }).doOnSubscribe(new Consumer<Disposable>() {
+            @Override public void accept(@NonNull Disposable disposable) throws Exception {
+                mIsCropping.set(true);
+            }
+        }).doFinally(new Action() {
+            @Override public void run() throws Exception {
+                mIsCropping.set(false);
+            }
+        });
+    }
+
+    public Single<Bitmap> cropAsSingle() {
+        return cropAsSingle(null);
+    }
+
+    public CropRequest crop(Uri sourceUri) {
+        return new CropRequest(this, sourceUri);
+    }
+
+    public void saveAsync(final Uri saveUri, final Bitmap image, final SaveCallback saveCallback) {
+        mExecutor.submit(new Runnable() {
+
+            @Override public void run() {
+                try {
+                    mIsSaving.set(true);
+                    saveImage(image, saveUri);
+
+                    mHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (saveCallback != null) saveCallback.onSuccess(saveUri);
+                        }
+                    });
+                } catch (Exception e) {
+                    postErrorOnMainThread(saveCallback, e);
+                } finally {
+                    mIsSaving.set(false);
+                }
+            }
+        });
+    }
+
+    public Single<Uri> saveAsSingle(final Bitmap bitmap, final Uri saveUri) {
+        return Single.fromCallable(new Callable<Uri>() {
+
+            @Override public Uri call() throws Exception {
+                return saveImage(bitmap, saveUri);
+            }
+        }).doOnSubscribe(new Consumer<Disposable>() {
+            @Override public void accept(@NonNull Disposable disposable) throws Exception {
+                mIsSaving.set(true);
+            }
+        }).doFinally(new Action() {
+            @Override public void run() throws Exception {
+                mIsSaving.set(false);
+            }
+        });
+    }
+
+    public SaveRequest save(Bitmap bitmap) {
+        return new SaveRequest(this, bitmap);
+    }
+
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
         final int viewWidth = MeasureSpec.getSize(widthMeasureSpec);
@@ -262,13 +677,706 @@ public class CropImageView extends AppCompatImageView {
         }
     }
 
+    @Override
+    protected void onDraw(Canvas canvas) {
+        canvas.drawColor(mBackgroundColor);
+        if (mIsInitialized) {
+            setMatrix();
+            Bitmap bm = getBitmap();
+            if (bm != null) {
+                canvas.drawBitmap(bm, mMatrix, mPaintBitmap);
+                drawCropFrame(canvas);
+            }
+        }
+        if (mIsDebug) {
+            drawDebugInfo(canvas);
+        }
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        mExecutor.shutdown();
+        super.onDetachedFromWindow();
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        if (!mIsInitialized) {
+            return false;
+        }
+        if (!mIsCropEnabled) {
+            return false;
+        }
+        if (!mIsEnabled) {
+            return false;
+        }
+        if (mIsRotating) {
+            return false;
+        }
+        if (mIsAnimating) {
+            return false;
+        }
+        if (mIsLoading.get()) {
+            return false;
+        }
+        if (mIsCropping.get()) {
+            return false;
+        }
+
+        switch (event.getAction()) {
+            case MotionEvent.ACTION_DOWN:
+                onDown(event);
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                onMove(event);
+                if (mTouchArea != TouchArea.OUT_OF_BOUNDS) {
+                    getParent().requestDisallowInterceptTouchEvent(true);
+                }
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                getParent().requestDisallowInterceptTouchEvent(false);
+                onCancel();
+                return true;
+            case MotionEvent.ACTION_UP:
+                getParent().requestDisallowInterceptTouchEvent(false);
+                onUp(event);
+                return true;
+        }
+        return false;
+    }
+
+    private Bitmap cropImage() throws IOException, IllegalStateException {
+        Bitmap cropped;
+
+        // Use thumbnail for getCroppedBitmap
+        if (mSourceUri == null) {
+            cropped = getCroppedBitmap();
+        }
+        // Use file for getCroppedBitmap
+        else {
+            cropped = getCroppedBitmapFromUri();
+            if (mCropMode == CropMode.CIRCLE) {
+                Bitmap circle = getCircularBitmap(cropped);
+                if (cropped != getBitmap()) {
+                    cropped.recycle();
+                }
+                cropped = circle;
+            }
+        }
+
+        cropped = scaleBitmapIfNeeded(cropped);
+
+        mOutputImageWidth = cropped.getWidth();
+        mOutputImageHeight = cropped.getHeight();
+
+        return cropped;
+    }
+
+    public void setCropMode(CropMode mode, int durationMillis) {
+        if (mode == CropMode.CUSTOM) {
+            setCustomRatio(1, 1);
+        } else {
+            mCropMode = mode;
+            recalculateFrameRect(durationMillis);
+        }
+    }
+
+    public void setCropMode(CropMode mode) {
+        setCropMode(mode, mAnimationDurationMillis);
+    }
+
+    public void setCustomRatio(int ratioX, int ratioY, int durationMillis) {
+        if (ratioX == 0 || ratioY == 0) return;
+        mCropMode = CropMode.CUSTOM;
+        mCustomRatio = new PointF(ratioX, ratioY);
+        recalculateFrameRect(durationMillis);
+    }
+
+    public void setCustomRatio(int ratioX, int ratioY) {
+        setCustomRatio(ratioX, ratioY, mAnimationDurationMillis);
+    }
+
+    public void setOverlayColor(int overlayColor) {
+        this.mOverlayColor = overlayColor;
+        invalidate();
+    }
+
+    public void setFrameColor(int frameColor) {
+        this.mFrameColor = frameColor;
+        invalidate();
+    }
+
+    public void setHandleColor(int handleColor) {
+        this.mHandleColor = handleColor;
+        invalidate();
+    }
+
+    public void setGuideColor(int guideColor) {
+        this.mGuideColor = guideColor;
+        invalidate();
+    }
+
+    public void setBackgroundColor(int bgColor) {
+        this.mBackgroundColor = bgColor;
+        invalidate();
+    }
+
+    public void setMinFrameSizeInDp(int minDp) {
+        mMinFrameSize = minDp * getDensity();
+    }
+
+    public void setMinFrameSizeInPx(int minPx) {
+        mMinFrameSize = minPx;
+    }
+
+    public void setHandleSizeInDp(int handleDp) {
+        mHandleSize = (int) (handleDp * getDensity());
+    }
+
+    public void setTouchPaddingInDp(int paddingDp) {
+        mTouchPadding = (int) (paddingDp * getDensity());
+    }
+
+    public void setFrameStrokeWeightInDp(int weightDp) {
+        mFrameStrokeWeight = weightDp * getDensity();
+        invalidate();
+    }
+
+    public void setGuideStrokeWeightInDp(int weightDp) {
+        mGuideStrokeWeight = weightDp * getDensity();
+        invalidate();
+    }
+
+    public void setCropEnabled(boolean enabled) {
+        mIsCropEnabled = enabled;
+        invalidate();
+    }
+
+    @Override public void setEnabled(boolean enabled) {
+        super.setEnabled(enabled);
+        mIsEnabled = enabled;
+    }
+
+    public void setInitialFrameScale(float initialScale) {
+        mInitialFrameScale = constrain(initialScale, 0.01f, 1.0f, DEFAULT_INITIAL_FRAME_SCALE);
+    }
+
+    public void setAnimationEnabled(boolean enabled) {
+        mIsAnimationEnabled = enabled;
+    }
+
+    public void setAnimationDuration(int durationMillis) {
+        mAnimationDurationMillis = durationMillis;
+    }
+
+    public void setInterpolator(Interpolator interpolator) {
+        mInterpolator = interpolator;
+        mAnimator = null;
+        setupAnimatorIfNeeded();
+    }
+
+    public void setDebug(boolean debug) {
+        mIsDebug = debug;
+        Logger.enabled = true;
+        invalidate();
+    }
+
+    public void setLoggingEnabled(boolean enabled) {
+        Logger.enabled = enabled;
+    }
+
+    public void setOutputWidth(int outputWidth) {
+        mOutputWidth = outputWidth;
+        mOutputHeight = 0;
+    }
+
+    public void setOutputHeight(int outputHeight) {
+        mOutputHeight = outputHeight;
+        mOutputWidth = 0;
+    }
+
+    public void setOutputMaxSize(int maxWidth, int maxHeight) {
+        mOutputMaxWidth = maxWidth;
+        mOutputMaxHeight = maxHeight;
+    }
+
+    public void setCompressFormat(Bitmap.CompressFormat format) {
+        mCompressFormat = format;
+    }
+
+    public void setCompressQuality(int quality) {
+        mCompressQuality = quality;
+    }
+
+    public void setHandleShadowEnabled(boolean handleShadowEnabled) {
+        mIsHandleShadowEnabled = handleShadowEnabled;
+    }
+
+    public boolean isCropping() {
+        return mIsCropping.get();
+    }
+
+    public Uri getSourceUri() {
+        return mSourceUri;
+    }
+
+    public Uri getSaveUri() {
+        return mSaveUri;
+    }
+
+    public boolean isSaving() {
+        return mIsSaving.get();
+    }
+
+
+    private void onDown(MotionEvent event) {
+        invalidate();
+        mLastX = event.getX();
+        mLastY = event.getY();
+        checkTouchArea(event.getX(), event.getY());
+    }
+
+    private void onMove(MotionEvent event) {
+        float diffX = event.getX() - mLastX;
+        float diffY = event.getY() - mLastY;
+        switch (mTouchArea) {
+            case CENTER:
+                moveFrame(diffX, diffY);
+                break;
+            case LEFT_TOP:
+                moveHandleLT(diffX, diffY);
+                break;
+            case RIGHT_TOP:
+                moveHandleRT(diffX, diffY);
+                break;
+            case LEFT_BOTTOM:
+                moveHandleLB(diffX, diffY);
+                break;
+            case RIGHT_BOTTOM:
+                moveHandleRB(diffX, diffY);
+                break;
+            case OUT_OF_BOUNDS:
+                break;
+        }
+        invalidate();
+        mLastX = event.getX();
+        mLastY = event.getY();
+    }
+
+    private void onUp(MotionEvent event) {
+        if (mGuideShowMode == ShowMode.SHOW_ON_TOUCH) {
+            mShowGuide = false;
+        }
+        if (mHandleShowMode == ShowMode.SHOW_ON_TOUCH) {
+            mShowHandle = false;
+        }
+        mTouchArea = TouchArea.OUT_OF_BOUNDS;
+        invalidate();
+    }
+
+    private void onCancel() {
+        mTouchArea = TouchArea.OUT_OF_BOUNDS;
+        invalidate();
+    }
+
+    private void moveFrame(float x, float y) {
+        mFrameRect.left += x;
+        mFrameRect.right += x;
+        mFrameRect.top += y;
+        mFrameRect.bottom += y;
+        checkMoveBounds();
+    }
+
+    private void moveHandleLT(float diffX, float diffY) {
+        if (mCropMode == CropMode.FREE) {
+            mFrameRect.left += diffX;
+            mFrameRect.top += diffY;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.left -= offsetX;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.top -= offsetY;
+            }
+            checkScaleBounds();
+        } else {
+            float dx = diffX;
+            float dy = diffX * getRatioY() / getRatioX();
+            mFrameRect.left += dx;
+            mFrameRect.top += dy;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.left -= offsetX;
+                float offsetY = offsetX * getRatioY() / getRatioX();
+                mFrameRect.top -= offsetY;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.top -= offsetY;
+                float offsetX = offsetY * getRatioX() / getRatioY();
+                mFrameRect.left -= offsetX;
+            }
+            float ox, oy;
+            if (!isInsideHorizontal(mFrameRect.left)) {
+                ox = mImageRect.left - mFrameRect.left;
+                mFrameRect.left += ox;
+                oy = ox * getRatioY() / getRatioX();
+                mFrameRect.top += oy;
+            }
+            if (!isInsideVertical(mFrameRect.top)) {
+                oy = mImageRect.top - mFrameRect.top;
+                mFrameRect.top += oy;
+                ox = oy * getRatioX() / getRatioY();
+                mFrameRect.left += ox;
+            }
+        }
+    }
+
+    private void moveHandleRT(float diffX, float diffY) {
+        if (mCropMode == CropMode.FREE) {
+            mFrameRect.right += diffX;
+            mFrameRect.top += diffY;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.right += offsetX;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.top -= offsetY;
+            }
+            checkScaleBounds();
+        } else {
+            float dx = diffX;
+            float dy = diffX * getRatioY() / getRatioX();
+            mFrameRect.right += dx;
+            mFrameRect.top -= dy;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.right += offsetX;
+                float offsetY = offsetX * getRatioY() / getRatioX();
+                mFrameRect.top -= offsetY;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.top -= offsetY;
+                float offsetX = offsetY * getRatioX() / getRatioY();
+                mFrameRect.right += offsetX;
+            }
+            float ox, oy;
+            if (!isInsideHorizontal(mFrameRect.right)) {
+                ox = mFrameRect.right - mImageRect.right;
+                mFrameRect.right -= ox;
+                oy = ox * getRatioY() / getRatioX();
+                mFrameRect.top += oy;
+            }
+            if (!isInsideVertical(mFrameRect.top)) {
+                oy = mImageRect.top - mFrameRect.top;
+                mFrameRect.top += oy;
+                ox = oy * getRatioX() / getRatioY();
+                mFrameRect.right -= ox;
+            }
+        }
+    }
+
+    private void moveHandleLB(float diffX, float diffY) {
+        if (mCropMode == CropMode.FREE) {
+            mFrameRect.left += diffX;
+            mFrameRect.bottom += diffY;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.left -= offsetX;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.bottom += offsetY;
+            }
+            checkScaleBounds();
+        } else {
+            float dx = diffX;
+            float dy = diffX * getRatioY() / getRatioX();
+            mFrameRect.left += dx;
+            mFrameRect.bottom -= dy;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.left -= offsetX;
+                float offsetY = offsetX * getRatioY() / getRatioX();
+                mFrameRect.bottom += offsetY;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.bottom += offsetY;
+                float offsetX = offsetY * getRatioX() / getRatioY();
+                mFrameRect.left -= offsetX;
+            }
+            float ox, oy;
+            if (!isInsideHorizontal(mFrameRect.left)) {
+                ox = mImageRect.left - mFrameRect.left;
+                mFrameRect.left += ox;
+                oy = ox * getRatioY() / getRatioX();
+                mFrameRect.bottom -= oy;
+            }
+            if (!isInsideVertical(mFrameRect.bottom)) {
+                oy = mFrameRect.bottom - mImageRect.bottom;
+                mFrameRect.bottom -= oy;
+                ox = oy * getRatioX() / getRatioY();
+                mFrameRect.left += ox;
+            }
+        }
+    }
+
+    private void moveHandleRB(float diffX, float diffY) {
+        if (mCropMode == CropMode.FREE) {
+            mFrameRect.right += diffX;
+            mFrameRect.bottom += diffY;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.right += offsetX;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.bottom += offsetY;
+            }
+            checkScaleBounds();
+        } else {
+            float dx = diffX;
+            float dy = diffX * getRatioY() / getRatioX();
+            mFrameRect.right += dx;
+            mFrameRect.bottom += dy;
+            if (isWidthTooSmall()) {
+                float offsetX = mMinFrameSize - getFrameW();
+                mFrameRect.right += offsetX;
+                float offsetY = offsetX * getRatioY() / getRatioX();
+                mFrameRect.bottom += offsetY;
+            }
+            if (isHeightTooSmall()) {
+                float offsetY = mMinFrameSize - getFrameH();
+                mFrameRect.bottom += offsetY;
+                float offsetX = offsetY * getRatioX() / getRatioY();
+                mFrameRect.right += offsetX;
+            }
+            float ox, oy;
+            if (!isInsideHorizontal(mFrameRect.right)) {
+                ox = mFrameRect.right - mImageRect.right;
+                mFrameRect.right -= ox;
+                oy = ox * getRatioY() / getRatioX();
+                mFrameRect.bottom -= oy;
+            }
+            if (!isInsideVertical(mFrameRect.bottom)) {
+                oy = mFrameRect.bottom - mImageRect.bottom;
+                mFrameRect.bottom -= oy;
+                ox = oy * getRatioX() / getRatioY();
+                mFrameRect.right -= ox;
+            }
+        }
+    }
+
+    private boolean isInsideHorizontal(float x) {
+        return mImageRect.left <= x && mImageRect.right >= x;
+    }
+
+    private boolean isInsideVertical(float y) {
+        return mImageRect.top <= y && mImageRect.bottom >= y;
+    }
+
+    private boolean isWidthTooSmall() {
+        return getFrameW() < mMinFrameSize;
+    }
+
+    private boolean isHeightTooSmall() {
+        return getFrameH() < mMinFrameSize;
+    }
+
+    private float getFrameW() {
+        return (mFrameRect.right - mFrameRect.left);
+    }
+
+    private float getFrameH() {
+        return (mFrameRect.bottom - mFrameRect.top);
+    }
+
+    private void checkScaleBounds() {
+        float lDiff = mFrameRect.left - mImageRect.left;
+        float rDiff = mFrameRect.right - mImageRect.right;
+        float tDiff = mFrameRect.top - mImageRect.top;
+        float bDiff = mFrameRect.bottom - mImageRect.bottom;
+
+        if (lDiff < 0) {
+            mFrameRect.left -= lDiff;
+        }
+        if (rDiff > 0) {
+            mFrameRect.right -= rDiff;
+        }
+        if (tDiff < 0) {
+            mFrameRect.top -= tDiff;
+        }
+        if (bDiff > 0) {
+            mFrameRect.bottom -= bDiff;
+        }
+    }
+
+    private void checkMoveBounds() {
+        float diff = mFrameRect.left - mImageRect.left;
+        if (diff < 0) {
+            mFrameRect.left -= diff;
+            mFrameRect.right -= diff;
+        }
+        diff = mFrameRect.right - mImageRect.right;
+        if (diff > 0) {
+            mFrameRect.left -= diff;
+            mFrameRect.right -= diff;
+        }
+        diff = mFrameRect.top - mImageRect.top;
+        if (diff < 0) {
+            mFrameRect.top -= diff;
+            mFrameRect.bottom -= diff;
+        }
+        diff = mFrameRect.bottom - mImageRect.bottom;
+        if (diff > 0) {
+            mFrameRect.top -= diff;
+            mFrameRect.bottom -= diff;
+        }
+    }
+
+    private void updateLayout() {
+        Drawable d = getDrawable();
+        if (d != null) {
+            setupLayout(mViewWidth, mViewHeight);
+        }
+    }
+
+    private void resetImageInfo() {
+        if (mIsLoading.get()) return;
+        mSourceUri = null;
+        mSaveUri = null;
+        mInputImageWidth = 0;
+        mInputImageHeight = 0;
+        mOutputImageWidth = 0;
+        mOutputImageHeight = 0;
+        mAngle = mExifRotation;
+    }
+
+    private void checkTouchArea(float x, float y) {
+        if (isInsideCornerLeftTop(x, y)) {
+            mTouchArea = TouchArea.LEFT_TOP;
+            if (mHandleShowMode == ShowMode.SHOW_ON_TOUCH) mShowHandle = true;
+            if (mGuideShowMode == ShowMode.SHOW_ON_TOUCH) mShowGuide = true;
+            return;
+        }
+        if (isInsideCornerRightTop(x, y)) {
+            mTouchArea = TouchArea.RIGHT_TOP;
+            if (mHandleShowMode == ShowMode.SHOW_ON_TOUCH) mShowHandle = true;
+            if (mGuideShowMode == ShowMode.SHOW_ON_TOUCH) mShowGuide = true;
+            return;
+        }
+        if (isInsideCornerLeftBottom(x, y)) {
+            mTouchArea = TouchArea.LEFT_BOTTOM;
+            if (mHandleShowMode == ShowMode.SHOW_ON_TOUCH) mShowHandle = true;
+            if (mGuideShowMode == ShowMode.SHOW_ON_TOUCH) mShowGuide = true;
+            return;
+        }
+        if (isInsideCornerRightBottom(x, y)) {
+            mTouchArea = TouchArea.RIGHT_BOTTOM;
+            if (mHandleShowMode == ShowMode.SHOW_ON_TOUCH) mShowHandle = true;
+            if (mGuideShowMode == ShowMode.SHOW_ON_TOUCH) mShowGuide = true;
+            return;
+        }
+        if (isInsideFrame(x, y)) {
+            if (mGuideShowMode == ShowMode.SHOW_ON_TOUCH) mShowGuide = true;
+            mTouchArea = TouchArea.CENTER;
+            return;
+        }
+        mTouchArea = TouchArea.OUT_OF_BOUNDS;
+    }
+
+    private boolean isInsideCornerLeftTop(float x, float y) {
+        float dx = x - mFrameRect.left;
+        float dy = y - mFrameRect.top;
+        float d = dx * dx + dy * dy;
+        return sq(mHandleSize + mTouchPadding) >= d;
+    }
+
+    private boolean isInsideCornerRightTop(float x, float y) {
+        float dx = x - mFrameRect.right;
+        float dy = y - mFrameRect.top;
+        float d = dx * dx + dy * dy;
+        return sq(mHandleSize + mTouchPadding) >= d;
+    }
+
+    private boolean isInsideCornerLeftBottom(float x, float y) {
+        float dx = x - mFrameRect.left;
+        float dy = y - mFrameRect.bottom;
+        float d = dx * dx + dy * dy;
+        return sq(mHandleSize + mTouchPadding) >= d;
+    }
+
+    private boolean isInsideCornerRightBottom(float x, float y) {
+        float dx = x - mFrameRect.right;
+        float dy = y - mFrameRect.bottom;
+        float d = dx * dx + dy * dy;
+        return sq(mHandleSize + mTouchPadding) >= d;
+    }
+
+    private boolean isInsideFrame(float x, float y) {
+        if (mFrameRect.left <= x && mFrameRect.right >= x) {
+            if (mFrameRect.top <= y && mFrameRect.bottom >= y) {
+                mTouchArea = TouchArea.CENTER;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void recalculateFrameRect(int durationMillis) {
+        if (mImageRect == null) return;
+        if (mIsAnimating) {
+            getAnimator().cancelAnimation();
+        }
+        final RectF currentRect = new RectF(mFrameRect);
+        final RectF newRect = calcFrameRect(mImageRect);
+        final float diffL = newRect.left - currentRect.left;
+        final float diffT = newRect.top - currentRect.top;
+        final float diffR = newRect.right - currentRect.right;
+        final float diffB = newRect.bottom - currentRect.bottom;
+        if (mIsAnimationEnabled) {
+            SimpleValueAnimator animator = getAnimator();
+            animator.addAnimatorListener(new SimpleValueAnimatorListener() {
+                @Override public void onAnimationStarted() {
+                    mIsAnimating = true;
+                }
+
+                @Override public void onAnimationUpdate(float scale) {
+                    mFrameRect = new RectF(currentRect.left + diffL * scale, currentRect.top + diffT * scale,
+                            currentRect.right + diffR * scale, currentRect.bottom + diffB * scale);
+                    invalidate();
+                }
+
+                @Override public void onAnimationFinished() {
+                    mFrameRect = newRect;
+                    invalidate();
+                    mIsAnimating = false;
+                }
+            });
+            animator.startAnimation(durationMillis);
+        } else {
+            mFrameRect = calcFrameRect(mImageRect);
+            invalidate();
+        }
+    }
+
     private void setupLayout(int viewW, int viewH) {
         if (viewW == 0 || viewH == 0) return;
         setCenter(new PointF(getPaddingLeft() + viewW * 0.5f, getPaddingTop() + viewH * 0.5f));
         setScale(calcScale(viewW, viewH, mAngle));
         setMatrix();
         mImageRect = calcImageRect(new RectF(0f, 0f, mImgWidth, mImgHeight), mMatrix);
-        // todo
+        if (mInitialFrameRect != null) {
+            mFrameRect = applyInitialFrameRect(mInitialFrameRect);
+        } else {
+            mFrameRect = calcFrameRect(mImageRect);
+        }
+        mIsInitialized = true;
+        invalidate();
     }
 
     private void setCenter(PointF center) {
@@ -290,6 +1398,48 @@ public class CropImageView extends AppCompatImageView {
         RectF applied = new RectF();
         matrix.mapRect(applied, rectF);
         return applied;
+    }
+
+    private RectF applyInitialFrameRect(RectF initialFrameRect) {
+        RectF frameRect = new RectF();
+        frameRect.set(initialFrameRect.left * mScale, initialFrameRect.top * mScale, initialFrameRect.right * mScale, initialFrameRect.bottom * mScale);
+        frameRect.offset(mImageRect.left, mImageRect.top);
+        float l = Math.max(mImageRect.left, frameRect.left);
+        float t = Math.max(mImageRect.top, frameRect.top);
+        float r = Math.min(mImageRect.right, frameRect.right);
+        float b = Math.min(mImageRect.bottom, frameRect.bottom);
+        frameRect.set(l, t, r, b);
+        return frameRect;
+    }
+
+    private RectF calcFrameRect(RectF imageRect) {
+        float frameW = getRatioX(imageRect.width());
+        float frameH = getRatioY(imageRect.height());
+        float imgRatio = imageRect.width() / imageRect.height();
+        float frameRatio = frameW / frameH;
+        float l = imageRect.left, t = imageRect.top, r = imageRect.right, b = imageRect.bottom;
+        if (frameRatio >= imgRatio) {
+            l = imageRect.left;
+            r = imageRect.right;
+            float hy = (imageRect.top + imageRect.bottom) * 0.5f;
+            float hh = (imageRect.width() / frameRatio) * 0.5f;
+            t = hy - hh;
+            b = hy + hh;
+        } else if (frameRatio < imgRatio) {
+            t = imageRect.top;
+            b = imageRect.bottom;
+            float hx = (imageRect.left + imageRect.right) * 0.5f;
+            float hw = imageRect.height() * frameRatio * 0.5f;
+            l = hx - hw;
+            r = hx + hw;
+        }
+        float w = r - l;
+        float h = b - t;
+        float cx = l + w / 2;
+        float cy = t + h / 2;
+        float sw = w * mInitialFrameScale;
+        float sh = h * mInitialFrameScale;
+        return new RectF(cx - sw / 2, cy - sh / 2, cx + sw / 2, cy + sh / 2);
     }
 
     private float calcScale(int viewW, int viewH, float angle) {
@@ -360,6 +1510,139 @@ public class CropImageView extends AppCompatImageView {
         } finally {
             ta.recycle();
         }
+    }
+
+    private void drawDebugInfo(Canvas canvas) {
+        Paint.FontMetrics fontMetrics = mPaintDebug.getFontMetrics();
+        mPaintDebug.measureText("W");
+        int textHeight = (int) (fontMetrics.descent - fontMetrics.ascent);
+        int x = (int) (mImageRect.left + (float) mHandleSize * 0.5f * getDensity());
+        int y = (int) (mImageRect.top + textHeight + (float) mHandleSize * 0.5f * getDensity());
+        StringBuilder builder = new StringBuilder();
+        builder.append("LOADED FROM: ").append(mSourceUri != null ? "Uri" : "Bitmap");
+        canvas.drawText(builder.toString(), x, y, mPaintDebug);
+        builder = new StringBuilder();
+
+        if (mSourceUri == null) {
+            builder.append("INPUT_IMAGE_SIZE: ")
+                    .append((int) mImgWidth)
+                    .append("x")
+                    .append((int) mImgHeight);
+            y += textHeight;
+            canvas.drawText(builder.toString(), x, y, mPaintDebug);
+            builder = new StringBuilder();
+        } else {
+            builder = new StringBuilder().append("INPUT_IMAGE_SIZE: ")
+                    .append(mInputImageWidth)
+                    .append("x")
+                    .append(mInputImageHeight);
+            y += textHeight;
+            canvas.drawText(builder.toString(), x, y, mPaintDebug);
+            builder = new StringBuilder();
+        }
+        builder.append("LOADED_IMAGE_SIZE: ")
+                .append(getBitmap().getWidth())
+                .append("x")
+                .append(getBitmap().getHeight());
+        y += textHeight;
+        canvas.drawText(builder.toString(), x, y, mPaintDebug);
+        builder = new StringBuilder();
+        if (mOutputImageWidth > 0 && mOutputImageHeight > 0) {
+            builder.append("OUTPUT_IMAGE_SIZE: ")
+                    .append(mOutputImageWidth)
+                    .append("x")
+                    .append(mOutputImageHeight);
+            y += textHeight;
+            canvas.drawText(builder.toString(), x, y, mPaintDebug);
+            builder = new StringBuilder().append("EXIF ROTATION: ").append(mExifRotation);
+            y += textHeight;
+            canvas.drawText(builder.toString(), x, y, mPaintDebug);
+            builder = new StringBuilder().append("CURRENT_ROTATION: ").append((int) mAngle);
+            y += textHeight;
+            canvas.drawText(builder.toString(), x, y, mPaintDebug);
+        }
+        builder = new StringBuilder();
+        builder.append("FRAME_RECT: ").append(mFrameRect.toString());
+        y += textHeight;
+        canvas.drawText(builder.toString(), x, y, mPaintDebug);
+        builder = new StringBuilder();
+        builder.append("ACTUAL_CROP_RECT: ").append(getActualCropRect() != null ? getActualCropRect().toString() : "");
+        y += textHeight;
+        canvas.drawText(builder.toString(), x, y, mPaintDebug);
+    }
+
+    private void drawCropFrame(Canvas canvas) {
+        if (!mIsCropEnabled) return;
+        if (mIsRotating) return;
+        drawOverlay(canvas);
+        drawFrame(canvas);
+        if (mShowGuide) drawGuidelines(canvas);
+        if (mShowHandle) drawHandles(canvas);
+    }
+
+    private void drawOverlay(Canvas canvas) {
+        mPaintTranslucent.setAntiAlias(true);
+        mPaintTranslucent.setFilterBitmap(true);
+        mPaintTranslucent.setColor(mOverlayColor);
+        mPaintTranslucent.setStyle(Paint.Style.FILL);
+        Path path = new Path();
+        RectF overlayRect = new RectF((float) Math.floor(mImageRect.left), (float) Math.floor(mImageRect.top), (float) Math.ceil(mImageRect.right), (float) Math.ceil(mImageRect.bottom));
+        if (!mIsAnimating && (mCropMode == CropMode.CIRCLE || mCropMode == CropMode.CIRCLE_SQUARE)) {
+            path.addRect(overlayRect, Path.Direction.CW);
+            PointF circleCenter = new PointF((mFrameRect.left + mFrameRect.right) / 2, (mFrameRect.top + mFrameRect.bottom) / 2);
+            float circleRaidus = (mFrameRect.right - mFrameRect.left) / 2;
+            path.addCircle(circleCenter.x, circleCenter.y, circleRaidus, Path.Direction.CCW);
+            canvas.drawPath(path, mPaintTranslucent);
+        } else {
+            path.addRect(overlayRect, Path.Direction.CW);
+            path.addRect(mFrameRect, Path.Direction.CCW);
+            canvas.drawPath(path, mPaintTranslucent);
+        }
+    }
+
+    private void drawFrame(Canvas canvas) {
+        mPaintFrame.setAntiAlias(true);
+        mPaintFrame.setFilterBitmap(true);
+        mPaintFrame.setStyle(Paint.Style.STROKE);
+        mPaintFrame.setColor(mFrameColor);
+        mPaintFrame.setStrokeWidth(mFrameStrokeWeight);
+        canvas.drawRect(mFrameRect, mPaintFrame);
+    }
+
+    private void drawGuidelines(Canvas canvas) {
+        mPaintFrame.setColor(mGuideColor);
+        mPaintFrame.setStrokeWidth(mGuideStrokeWeight);
+        float h1 = mFrameRect.left + (mFrameRect.right - mFrameRect.left) / 3.0f;
+        float h2 = mFrameRect.right - (mFrameRect.right - mFrameRect.left) / 3.0f;
+        float v1 = mFrameRect.top + (mFrameRect.bottom - mFrameRect.top) / 3.0f;
+        float v2 = mFrameRect.bottom - (mFrameRect.bottom - mFrameRect.top) / 3.0f;
+        canvas.drawLine(h1, mFrameRect.top, h1, mFrameRect.bottom, mPaintFrame);
+        canvas.drawLine(h2, mFrameRect.top, h2, mFrameRect.bottom, mPaintFrame);
+        canvas.drawLine(mFrameRect.left, v1, mFrameRect.right, v1, mPaintFrame);
+        canvas.drawLine(mFrameRect.left, v2, mFrameRect.right, v2, mPaintFrame);
+    }
+
+    private void drawHandles(Canvas canvas) {
+        if (mIsHandleShadowEnabled) {
+            drawHandleShadows(canvas);
+        }
+        mPaintFrame.setStyle(Paint.Style.FILL);
+        mPaintFrame.setColor(mHandleColor);
+        canvas.drawCircle(mFrameRect.left, mFrameRect.top, mHandleSize, mPaintFrame);
+        canvas.drawCircle(mFrameRect.right, mFrameRect.top, mHandleSize, mPaintFrame);
+        canvas.drawCircle(mFrameRect.left, mFrameRect.bottom, mHandleSize, mPaintFrame);
+        canvas.drawCircle(mFrameRect.right, mFrameRect.bottom, mHandleSize, mPaintFrame);
+    }
+
+    private void drawHandleShadows(Canvas canvas) {
+        mPaintFrame.setStyle(Paint.Style.FILL);
+        mPaintFrame.setColor(TRANSLUCENT_BLACK);
+        RectF rect = new RectF(mFrameRect);
+        rect.offset(0, 1);
+        canvas.drawCircle(rect.left, rect.top, mHandleSize, mPaintFrame);
+        canvas.drawCircle(rect.right, rect.top, mHandleSize, mPaintFrame);
+        canvas.drawCircle(rect.left, rect.bottom, mHandleSize, mPaintFrame);
+        canvas.drawCircle(rect.right, rect.bottom, mHandleSize, mPaintFrame);
     }
 
     public void setGuideShowMode(ShowMode mode) {
@@ -448,6 +1731,117 @@ public class CropImageView extends AppCompatImageView {
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), rotateMatrix, true);
     }
 
+    private float getRatioX(float w) {
+        switch (mCropMode) {
+            case FIT_IMAGE:
+                return mImageRect.width();
+            case FREE:
+                return w;
+            case RATIO_4_3:
+                return 4;
+            case RATIO_3_4:
+                return 3;
+            case RATIO_16_9:
+                return 16;
+            case RATIO_9_16:
+                return 9;
+            case SQUARE:
+            case CIRCLE:
+            case CIRCLE_SQUARE:
+                return 1;
+            case CUSTOM:
+                return mCustomRatio.x;
+            default:
+                return w;
+        }
+    }
+
+    private float getRatioY(float h) {
+        switch (mCropMode) {
+            case FIT_IMAGE:
+                return mImageRect.height();
+            case FREE:
+                return h;
+            case RATIO_4_3:
+                return 3;
+            case RATIO_3_4:
+                return 4;
+            case RATIO_16_9:
+                return 9;
+            case RATIO_9_16:
+                return 16;
+            case SQUARE:
+            case CIRCLE:
+            case CIRCLE_SQUARE:
+                return 1;
+            case CUSTOM:
+                return mCustomRatio.y;
+            default:
+                return h;
+        }
+    }
+
+    private float getRatioX() {
+        switch (mCropMode) {
+            case FIT_IMAGE:
+                return mImageRect.width();
+            case RATIO_4_3:
+                return 4;
+            case RATIO_3_4:
+                return 3;
+            case RATIO_16_9:
+                return 16;
+            case RATIO_9_16:
+                return 9;
+            case SQUARE:
+            case CIRCLE:
+            case CIRCLE_SQUARE:
+                return 1;
+            case CUSTOM:
+                return mCustomRatio.x;
+            default:
+                return 1;
+        }
+    }
+
+    private float getRatioY() {
+        switch (mCropMode) {
+            case FIT_IMAGE:
+                return mImageRect.height();
+            case RATIO_4_3:
+                return 3;
+            case RATIO_3_4:
+                return 4;
+            case RATIO_16_9:
+                return 9;
+            case RATIO_9_16:
+                return 16;
+            case SQUARE:
+            case CIRCLE:
+            case CIRCLE_SQUARE:
+                return 1;
+            case CUSTOM:
+                return mCustomRatio.y;
+            default:
+                return 1;
+        }
+    }
+
+    public RectF getActualCropRect() {
+        if(mImageRect == null) return null;
+        float offsetX = (mImageRect.left / mScale);
+        float offsetY = (mImageRect.top / mScale);
+        float l = (mFrameRect.left / mScale) - offsetX;
+        float t = (mFrameRect.top / mScale) - offsetY;
+        float r = (mFrameRect.right / mScale) - offsetX;
+        float b = (mFrameRect.bottom / mScale) - offsetY;
+        l = Math.max(0, l);
+        t = Math.max(0, t);
+        r = Math.min(mImageRect.right / mScale, r);
+        b = Math.min(mImageRect.bottom / mScale, b);
+        return new RectF(l, t, r, b);
+    }
+
     // Animation ///////////////////////////////////////////////////////////////////////////////////
 
     private SimpleValueAnimator getAnimator() {
@@ -462,6 +1856,109 @@ public class CropImageView extends AppCompatImageView {
             } else {
                 mAnimator = new ValueAnimatorV14(mInterpolator);
             }
+        }
+    }
+
+    private Bitmap getCroppedBitmapFromUri() throws IOException {
+        Bitmap cropped = null;
+        InputStream is = null;
+        try {
+            is = getContext().getContentResolver().openInputStream(mSourceUri);
+            BitmapRegionDecoder decoder = BitmapRegionDecoder.newInstance(is, false);
+            final int originalImageWidth = decoder.getWidth();
+            final int originalImageHeight = decoder.getHeight();
+            Rect cropRect = calcCropRect(originalImageWidth, originalImageHeight);
+            if (mAngle != 0) {
+                Matrix matrix = new Matrix();
+                matrix.setRotate(-mAngle);
+                RectF rotated = new RectF();
+                matrix.mapRect(rotated, new RectF(cropRect));
+                rotated.offset(rotated.left < 0 ? originalImageWidth : 0,
+                        rotated.top < 0 ? originalImageHeight : 0);
+                cropRect = new Rect((int) rotated.left, (int) rotated.top, (int) rotated.right,
+                        (int) rotated.bottom);
+            }
+            cropped = decoder.decodeRegion(cropRect, new BitmapFactory.Options());
+            if (mAngle != 0) {
+                Bitmap rotated = getRotatedBitmap(cropped);
+                if (cropped != getBitmap() && cropped != rotated) {
+                    cropped.recycle();
+                }
+                cropped = rotated;
+            }
+        } finally {
+            Utils.closeQuietly(is);
+        }
+        return cropped;
+    }
+
+    private Rect calcCropRect(int originalImageWidth, int originalImageHeight) {
+        float scaleToOriginal =
+                getRotatedWidth(mAngle, originalImageWidth, originalImageHeight) / mImageRect.width();
+        float offsetX = mImageRect.left * scaleToOriginal;
+        float offsetY = mImageRect.top * scaleToOriginal;
+        int left = Math.round(mFrameRect.left * scaleToOriginal - offsetX);
+        int top = Math.round(mFrameRect.top * scaleToOriginal - offsetY);
+        int right = Math.round(mFrameRect.right * scaleToOriginal - offsetX);
+        int bottom = Math.round(mFrameRect.bottom * scaleToOriginal - offsetY);
+        int imageW = Math.round(getRotatedWidth(mAngle, originalImageWidth, originalImageHeight));
+        int imageH = Math.round(getRotatedHeight(mAngle, originalImageWidth, originalImageHeight));
+        return new Rect(Math.max(left, 0), Math.max(top, 0), Math.min(right, imageW),
+                Math.min(bottom, imageH));
+    }
+
+    private Bitmap scaleBitmapIfNeeded(Bitmap cropped) {
+        int width = cropped.getWidth();
+        int height = cropped.getHeight();
+        int outWidth = 0;
+        int outHeight = 0;
+        float imageRatio = getRatioX(mFrameRect.width()) / getRatioY(mFrameRect.height());
+
+        if (mOutputWidth > 0) {
+            outWidth = mOutputWidth;
+            outHeight = Math.round(mOutputWidth / imageRatio);
+        } else if (mOutputHeight > 0) {
+            outHeight = mOutputHeight;
+            outWidth = Math.round(mOutputHeight * imageRatio);
+        } else {
+            if (mOutputMaxWidth > 0 && mOutputMaxHeight > 0 && (width > mOutputMaxWidth
+                    || height > mOutputMaxHeight)) {
+                float maxRatio = (float) mOutputMaxWidth / (float) mOutputMaxHeight;
+                if (maxRatio >= imageRatio) {
+                    outHeight = mOutputMaxHeight;
+                    outWidth = Math.round((float) mOutputMaxHeight * imageRatio);
+                } else {
+                    outWidth = mOutputMaxWidth;
+                    outHeight = Math.round((float) mOutputMaxWidth / imageRatio);
+                }
+            }
+        }
+
+        if (outWidth > 0 && outHeight > 0) {
+            Bitmap scaled = Utils.getScaledBitmap(cropped, outWidth, outHeight);
+            if (cropped != getBitmap() && cropped != scaled) {
+                cropped.recycle();
+            }
+            cropped = scaled;
+        }
+        return cropped;
+    }
+
+    private Uri saveImage(Bitmap bitmap, final Uri uri) throws IOException, IllegalStateException {
+        mSaveUri = uri;
+        if (mSaveUri == null) {
+            throw new IllegalStateException("Save uri must not be null.");
+        }
+
+        OutputStream outputStream = null;
+        try {
+            outputStream = getContext().getContentResolver().openOutputStream(uri);
+            bitmap.compress(mCompressFormat, mCompressQuality, outputStream);
+            Utils.copyExifInfo(getContext(), mSourceUri, uri, bitmap.getWidth(), bitmap.getHeight());
+            Utils.updateGalleryInfo(getContext(), uri);
+            return uri;
+        } finally {
+            Utils.closeQuietly(outputStream);
         }
     }
 
